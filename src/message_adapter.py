@@ -4,7 +4,7 @@ import re
 
 
 class MessageAdapter:
-    """Converts between OpenAI message format and Claude Code prompts."""
+    """Converts between OpenAI message format and CLI-friendly prompts."""
 
     @staticmethod
     def messages_to_prompt(messages: List[Message]) -> tuple[str, Optional[str]]:

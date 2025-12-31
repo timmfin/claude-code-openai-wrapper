@@ -66,8 +66,30 @@ CLAUDE_MODELS = [
 ]
 
 # Default model (recommended for most use cases)
-# Can be overridden via DEFAULT_MODEL environment variable
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
+# Can be overridden via DEFAULT_MODEL or DEFAULT_CLAUDE_MODEL environment variable
+DEFAULT_CLAUDE_MODEL = os.getenv(
+    "DEFAULT_CLAUDE_MODEL", os.getenv("DEFAULT_MODEL", "claude-sonnet-4-5-20250929")
+)
+DEFAULT_MODEL = DEFAULT_CLAUDE_MODEL
+
+# Supported gateway backends
+SUPPORTED_BACKENDS = ["claude", "gemini", "codex"]
+
+# Default backend for incoming requests
+DEFAULT_BACKEND = os.getenv("DEFAULT_BACKEND", "claude")
+
+# CLI path configuration
+BACKEND_CLI_ENV_VARS = {
+    "claude": "CLAUDE_CLI_PATH",
+    "gemini": "GEMINI_CLI_PATH",
+    "codex": "CODEX_CLI_PATH",
+}
+
+BACKEND_CLI_COMMANDS = {
+    "claude": "claude",
+    "gemini": "gemini",
+    "codex": "codex",
+}
 
 # Fast model (for speed/cost optimization)
 FAST_MODEL = "claude-haiku-4-5-20251001"

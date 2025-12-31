@@ -9,8 +9,8 @@ logger = logging.getLogger(__name__)
 # Import DEFAULT_MODEL to avoid circular imports
 def get_default_model():
     """Get default model from constants to avoid circular imports."""
-    from src.constants import DEFAULT_MODEL
-    return DEFAULT_MODEL
+    from src.constants import DEFAULT_BACKEND
+    return DEFAULT_BACKEND
 
 
 class ContentPart(BaseModel):
@@ -69,6 +69,9 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     session_id: Optional[str] = Field(
         default=None, description="Optional session ID for conversation continuity"
+    )
+    conversation_id: Optional[str] = Field(
+        default=None, description="Optional conversation ID (alias of session_id)"
     )
     enable_tools: Optional[bool] = Field(
         default=False,
@@ -168,7 +171,7 @@ class ChatCompletionRequest(BaseModel):
 
         return " ".join(instructions) if instructions else None
 
-    def to_claude_options(self) -> Dict[str, Any]:
+    def to_claude_options(self, model_override: Optional[str] = None) -> Dict[str, Any]:
         """Convert OpenAI request parameters to Claude Code SDK options."""
         # Log parameter handling information
         self.log_parameter_info()
@@ -176,8 +179,9 @@ class ChatCompletionRequest(BaseModel):
         options = {}
 
         # Direct mappings
-        if self.model:
-            options["model"] = self.model
+        model_name = model_override or self.model
+        if model_name:
+            options["model"] = model_name
 
         # Map max_tokens to max_thinking_tokens (best effort)
         max_token_value = self.max_completion_tokens or self.max_tokens
@@ -251,6 +255,8 @@ class ErrorResponse(BaseModel):
 
 class SessionInfo(BaseModel):
     session_id: str
+    backend: Optional[str] = None
+    cli_session_id: Optional[str] = None
     created_at: datetime
     last_accessed: datetime
     message_count: int

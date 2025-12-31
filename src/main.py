@@ -33,7 +33,6 @@ from src.models import (
     MCPServersListResponse,
     MCPConnectionRequest,
 )
-from src.claude_cli import ClaudeCodeCLI
 from src.message_adapter import MessageAdapter
 from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
@@ -45,7 +44,9 @@ from src.rate_limiter import (
     rate_limit_exceeded_handler,
     rate_limit_endpoint,
 )
-from src.constants import CLAUDE_MODELS, CLAUDE_TOOLS
+from src.constants import CLAUDE_MODELS, CLAUDE_TOOLS, SUPPORTED_BACKENDS
+from src.llm_adapters import PromptPayload
+from src.llm_gateway import BackendSelection, LLMGateway, PromptCacheHooks, resolve_backend
 
 # Load environment variables
 load_dotenv()
@@ -116,10 +117,9 @@ def prompt_for_api_protection() -> Optional[str]:
             return None
 
 
-# Initialize Claude CLI
-claude_cli = ClaudeCodeCLI(
-    timeout=int(os.getenv("MAX_TIMEOUT", "600000")), cwd=os.getenv("CLAUDE_CWD")
-)
+# Initialize gateway and hooks
+prompt_cache_hooks = PromptCacheHooks()
+gateway = LLMGateway(prompt_cache_hooks)
 
 
 @asynccontextmanager
@@ -141,25 +141,13 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(f"✅ Claude Code authentication validated: {auth_info['method']}")
 
-    # Verify Claude Agent SDK with timeout for graceful degradation
-    try:
-        logger.info("Testing Claude Agent SDK connection...")
-        # Use asyncio.wait_for to enforce timeout (30 seconds)
-        cli_verified = await asyncio.wait_for(claude_cli.verify_cli(), timeout=30.0)
-
-        if cli_verified:
-            logger.info("✅ Claude Agent SDK verified successfully")
+    # Verify CLI availability for each backend
+    backend_status = gateway.backend_status()
+    for backend, status in backend_status.items():
+        if status == "available":
+            logger.info("✅ %s CLI available", backend)
         else:
-            logger.warning("⚠️  Claude Agent SDK verification returned False")
-            logger.warning("The server will start, but requests may fail.")
-    except asyncio.TimeoutError:
-        logger.warning("⚠️  Claude Agent SDK verification timed out (30s)")
-        logger.warning("This may indicate network issues or SDK configuration problems.")
-        logger.warning("The server will start, but first request may be slow.")
-    except Exception as e:
-        logger.error(f"⚠️  Claude Agent SDK verification failed: {e}")
-        logger.warning("The server will start, but requests may fail.")
-        logger.warning("Check that Claude Code CLI is properly installed and authenticated.")
+            logger.warning("⚠️  %s CLI unavailable: %s", backend, status)
 
     # Log debug information if debug mode is enabled
     if DEBUG_MODE or VERBOSE:
@@ -341,151 +329,126 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 async def generate_streaming_response(
-    request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
+    request: ChatCompletionRequest,
+    request_id: str,
+    claude_headers: Dict[str, Any],
+    backend_selection: BackendSelection,
 ) -> AsyncGenerator[str, None]:
     """Generate SSE formatted streaming response."""
     try:
-        # Process messages with session management
-        all_messages, actual_session_id = session_manager.process_messages(
-            request.messages, request.session_id
+        session_id = request.conversation_id or request.session_id
+        all_messages, actual_session_id, session = session_manager.process_messages(
+            request.messages, session_id, backend_selection.backend
         )
 
-        # Convert messages to prompt
+        logger.info(
+            "Streaming chat completion: backend=%s session_id=%s",
+            backend_selection.backend,
+            actual_session_id,
+        )
+
+        session_context = (
+            session.to_context()
+            if session
+            else {"session_id": None, "backend": backend_selection.backend, "cli_session_id": None}
+        )
+
         prompt, system_prompt = MessageAdapter.messages_to_prompt(all_messages)
 
-        # Add sampling instructions from temperature/top_p if present
         sampling_instructions = request.get_sampling_instructions()
         if sampling_instructions:
             if system_prompt:
                 system_prompt = f"{system_prompt}\n\n{sampling_instructions}"
             else:
                 system_prompt = sampling_instructions
-            logger.debug(f"Added sampling instructions: {sampling_instructions}")
+            logger.debug("Added sampling instructions: %s", sampling_instructions)
 
-        # Filter content for unsupported features
         prompt = MessageAdapter.filter_content(prompt)
         if system_prompt:
             system_prompt = MessageAdapter.filter_content(system_prompt)
 
-        # Get Claude Agent SDK options from request
-        claude_options = request.to_claude_options()
+        if backend_selection.backend == "claude":
+            claude_options = request.to_claude_options(model_override=backend_selection.model)
 
-        # Merge with Claude-specific headers if provided
-        if claude_headers:
-            claude_options.update(claude_headers)
+            if claude_headers:
+                claude_options.update(claude_headers)
 
-        # Validate model
-        if claude_options.get("model"):
-            ParameterValidator.validate_model(claude_options["model"])
+            if claude_options.get("model"):
+                ParameterValidator.validate_model(claude_options["model"])
 
-        # Handle tools - disabled by default for OpenAI compatibility
-        if not request.enable_tools:
-            # Disable all tools by using CLAUDE_TOOLS constant
-            claude_options["disallowed_tools"] = CLAUDE_TOOLS
-            claude_options["max_turns"] = 1  # Single turn for Q&A
-            logger.info("Tools disabled (default behavior for OpenAI compatibility)")
-        else:
-            logger.info("Tools enabled by user request")
+            if not request.enable_tools:
+                claude_options["disallowed_tools"] = CLAUDE_TOOLS
+                claude_options["max_turns"] = 1
+                logger.info("Tools disabled (default behavior for OpenAI compatibility)")
+            else:
+                logger.info("Tools enabled by user request")
+        elif request.enable_tools:
+            logger.info("Tools flag ignored for backend '%s'", backend_selection.backend)
 
-        # Run Claude Code
-        chunks_buffer = []
-        role_sent = False  # Track if we've sent the initial role chunk
-        content_sent = False  # Track if we've sent any content
-
-        async for chunk in claude_cli.run_completion(
+        payload = PromptPayload(
             prompt=prompt,
             system_prompt=system_prompt,
-            model=claude_options.get("model"),
-            max_turns=claude_options.get("max_turns", 10),
-            allowed_tools=claude_options.get("allowed_tools"),
-            disallowed_tools=claude_options.get("disallowed_tools"),
-            stream=True,
-        ):
-            chunks_buffer.append(chunk)
+            model=backend_selection.model,
+            session_id=actual_session_id,
+        )
 
-            # Check if we have an assistant message
-            # Handle both old format (type/message structure) and new format (direct content)
-            content = None
-            if chunk.get("type") == "assistant" and "message" in chunk:
-                # Old format: {"type": "assistant", "message": {"content": [...]}}
-                message = chunk["message"]
-                if isinstance(message, dict) and "content" in message:
-                    content = message["content"]
-            elif "content" in chunk and isinstance(chunk["content"], list):
-                # New format: {"content": [TextBlock(...)]}  (converted AssistantMessage)
-                content = chunk["content"]
+        prompt_cache_hooks.before_send(payload, session_context)
 
-            if content is not None:
-                # Send initial role chunk if we haven't already
-                if not role_sent:
-                    initial_chunk = ChatCompletionStreamResponse(
-                        id=request_id,
-                        model=request.model,
-                        choices=[
-                            StreamChoice(
-                                index=0,
-                                delta={"role": "assistant", "content": ""},
-                                finish_reason=None,
-                            )
-                        ],
-                    )
-                    yield f"data: {initial_chunk.model_dump_json()}\n\n"
-                    role_sent = True
+        adapter = gateway.get_adapter(backend_selection.backend)
+        role_sent = False
+        content_sent = False
+        assistant_parts = []
 
-                # Handle content blocks
-                if isinstance(content, list):
-                    for block in content:
-                        # Handle TextBlock objects from Claude Agent SDK
-                        if hasattr(block, "text"):
-                            raw_text = block.text
-                        # Handle dictionary format for backward compatibility
-                        elif isinstance(block, dict) and block.get("type") == "text":
-                            raw_text = block.get("text", "")
-                        else:
-                            continue
+        async for chunk in adapter.send_prompt(payload):
+            prompt_cache_hooks.after_receive(chunk, session_context)
 
-                        # Filter out tool usage and thinking blocks
-                        filtered_text = MessageAdapter.filter_content(raw_text)
+            chunk_type = chunk.get("type")
+            if chunk_type == "error":
+                error_chunk = {"error": {"message": chunk.get("content", ""), "type": "backend_error"}}
+                yield f"data: {json.dumps(error_chunk)}\n\n"
+                return
 
-                        if filtered_text and not filtered_text.isspace():
-                            # Create streaming chunk
-                            stream_chunk = ChatCompletionStreamResponse(
-                                id=request_id,
-                                model=request.model,
-                                choices=[
-                                    StreamChoice(
-                                        index=0,
-                                        delta={"content": filtered_text},
-                                        finish_reason=None,
-                                    )
-                                ],
-                            )
+            if chunk_type == "tool":
+                logger.debug("Tool event from %s: %s", backend_selection.backend, chunk)
+                continue
 
-                            yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                            content_sent = True
+            if chunk_type == "done":
+                break
 
-                elif isinstance(content, str):
-                    # Filter out tool usage and thinking blocks
-                    filtered_content = MessageAdapter.filter_content(content)
+            if chunk_type != "delta":
+                continue
 
-                    if filtered_content and not filtered_content.isspace():
-                        # Create streaming chunk
-                        stream_chunk = ChatCompletionStreamResponse(
-                            id=request_id,
-                            model=request.model,
-                            choices=[
-                                StreamChoice(
-                                    index=0, delta={"content": filtered_content}, finish_reason=None
-                                )
-                            ],
+            filtered_text = MessageAdapter.filter_content(chunk.get("content", ""))
+            if not filtered_text or filtered_text.isspace():
+                continue
+
+            if not role_sent:
+                initial_chunk = ChatCompletionStreamResponse(
+                    id=request_id,
+                    model=request.model,
+                    choices=[
+                        StreamChoice(
+                            index=0,
+                            delta={"role": "assistant", "content": ""},
+                            finish_reason=None,
                         )
+                    ],
+                )
+                yield f"data: {initial_chunk.model_dump_json()}\n\n"
+                role_sent = True
 
-                        yield f"data: {stream_chunk.model_dump_json()}\n\n"
-                        content_sent = True
+            stream_chunk = ChatCompletionStreamResponse(
+                id=request_id,
+                model=request.model,
+                choices=[
+                    StreamChoice(index=0, delta={"content": filtered_text}, finish_reason=None)
+                ],
+            )
+            yield f"data: {stream_chunk.model_dump_json()}\n\n"
+            assistant_parts.append(filtered_text)
+            content_sent = True
 
-        # Handle case where no role was sent (send at least role chunk)
         if not role_sent:
-            # Send role chunk with empty content if we never got any assistant messages
             initial_chunk = ChatCompletionStreamResponse(
                 id=request_id,
                 model=request.model,
@@ -498,7 +461,6 @@ async def generate_streaming_response(
             yield f"data: {initial_chunk.model_dump_json()}\n\n"
             role_sent = True
 
-        # If we sent role but no content, send a minimal response
         if role_sent and not content_sent:
             fallback_chunk = ChatCompletionStreamResponse(
                 id=request_id,
@@ -513,30 +475,23 @@ async def generate_streaming_response(
             )
             yield f"data: {fallback_chunk.model_dump_json()}\n\n"
 
-        # Extract assistant response from all chunks
-        assistant_content = None
-        if chunks_buffer:
-            assistant_content = claude_cli.parse_claude_message(chunks_buffer)
+        assistant_content = "".join(assistant_parts).strip() if assistant_parts else None
+        if actual_session_id and assistant_content:
+            assistant_message = Message(role="assistant", content=assistant_content)
+            session_manager.add_assistant_response(actual_session_id, assistant_message)
 
-            # Store in session if applicable
-            if actual_session_id and assistant_content:
-                assistant_message = Message(role="assistant", content=assistant_content)
-                session_manager.add_assistant_response(actual_session_id, assistant_message)
-
-        # Prepare usage data if requested
         usage_data = None
         if request.stream_options and request.stream_options.include_usage:
-            # Estimate token usage based on prompt and completion
             completion_text = assistant_content or ""
-            token_usage = claude_cli.estimate_token_usage(prompt, completion_text, request.model)
+            prompt_tokens = MessageAdapter.estimate_tokens(prompt)
+            completion_tokens = MessageAdapter.estimate_tokens(completion_text)
             usage_data = Usage(
-                prompt_tokens=token_usage["prompt_tokens"],
-                completion_tokens=token_usage["completion_tokens"],
-                total_tokens=token_usage["total_tokens"],
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
             )
-            logger.debug(f"Estimated usage: {usage_data}")
+            logger.debug("Estimated usage: %s", usage_data)
 
-        # Send final chunk with finish reason and optionally usage data
         final_chunk = ChatCompletionStreamResponse(
             id=request_id,
             model=request.model,
@@ -547,7 +502,7 @@ async def generate_streaming_response(
         yield "data: [DONE]\n\n"
 
     except Exception as e:
-        logger.error(f"Streaming error: {e}")
+        logger.error("Streaming error: %s", e)
         error_chunk = {"error": {"message": str(e), "type": "streaming_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
 
@@ -563,19 +518,30 @@ async def chat_completions(
     # Check FastAPI API key if configured
     await verify_api_key(request, credentials)
 
-    # Validate Claude Code authentication
-    auth_valid, auth_info = validate_claude_code_auth()
-
-    if not auth_valid:
-        error_detail = {
-            "message": "Claude Code authentication failed",
-            "errors": auth_info.get("errors", []),
-            "method": auth_info.get("method", "none"),
-            "help": "Check /v1/auth/status for detailed authentication information",
-        }
-        raise HTTPException(status_code=503, detail=error_detail)
+    try:
+        backend_selection = resolve_backend(request_body.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
+
+        if backend_selection.backend == "claude":
+            auth_valid, auth_info = validate_claude_code_auth()
+
+            if not auth_valid:
+                error_detail = {
+                    "message": "Claude Code authentication failed",
+                    "errors": auth_info.get("errors", []),
+                    "method": auth_info.get("method", "none"),
+                    "help": "Check /v1/auth/status for detailed authentication information",
+                }
+                raise HTTPException(status_code=503, detail=error_detail)
+
+        try:
+            gateway.get_adapter(backend_selection.backend)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
 
         # Extract Claude-specific parameters from headers
@@ -589,7 +555,9 @@ async def chat_completions(
         if request_body.stream:
             # Return streaming response
             return StreamingResponse(
-                generate_streaming_response(request_body, request_id, claude_headers),
+                generate_streaming_response(
+                    request_body, request_id, claude_headers, backend_selection
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -598,13 +566,22 @@ async def chat_completions(
             )
         else:
             # Non-streaming response
-            # Process messages with session management
-            all_messages, actual_session_id = session_manager.process_messages(
-                request_body.messages, request_body.session_id
+            session_id = request_body.conversation_id or request_body.session_id
+            all_messages, actual_session_id, session = session_manager.process_messages(
+                request_body.messages, session_id, backend_selection.backend
             )
 
             logger.info(
-                f"Chat completion: session_id={actual_session_id}, total_messages={len(all_messages)}"
+                "Chat completion: backend=%s session_id=%s total_messages=%s",
+                backend_selection.backend,
+                actual_session_id,
+                len(all_messages),
+            )
+
+            session_context = (
+                session.to_context()
+                if session
+                else {"session_id": None, "backend": backend_selection.backend, "cli_session_id": None}
             )
 
             # Convert messages to prompt
@@ -624,47 +601,49 @@ async def chat_completions(
             if system_prompt:
                 system_prompt = MessageAdapter.filter_content(system_prompt)
 
-            # Get Claude Agent SDK options from request
-            claude_options = request_body.to_claude_options()
+            if backend_selection.backend == "claude":
+                claude_options = request_body.to_claude_options(
+                    model_override=backend_selection.model
+                )
 
-            # Merge with Claude-specific headers
-            if claude_headers:
-                claude_options.update(claude_headers)
+                if claude_headers:
+                    claude_options.update(claude_headers)
 
-            # Validate model
-            if claude_options.get("model"):
-                ParameterValidator.validate_model(claude_options["model"])
+                if claude_options.get("model"):
+                    ParameterValidator.validate_model(claude_options["model"])
 
-            # Handle tools - disabled by default for OpenAI compatibility
-            if not request_body.enable_tools:
-                # Disable all tools by using CLAUDE_TOOLS constant
-                claude_options["disallowed_tools"] = CLAUDE_TOOLS
-                claude_options["max_turns"] = 1  # Single turn for Q&A
-                logger.info("Tools disabled (default behavior for OpenAI compatibility)")
-            else:
-                logger.info("Tools enabled by user request")
+                if not request_body.enable_tools:
+                    claude_options["disallowed_tools"] = CLAUDE_TOOLS
+                    claude_options["max_turns"] = 1
+                    logger.info("Tools disabled (default behavior for OpenAI compatibility)")
+                else:
+                    logger.info("Tools enabled by user request")
+            elif request_body.enable_tools:
+                logger.info("Tools flag ignored for backend '%s'", backend_selection.backend)
 
-            # Collect all chunks
-            chunks = []
-            async for chunk in claude_cli.run_completion(
+            payload = PromptPayload(
                 prompt=prompt,
                 system_prompt=system_prompt,
-                model=claude_options.get("model"),
-                max_turns=claude_options.get("max_turns", 10),
-                allowed_tools=claude_options.get("allowed_tools"),
-                disallowed_tools=claude_options.get("disallowed_tools"),
-                stream=False,
-            ):
-                chunks.append(chunk)
+                model=backend_selection.model,
+                session_id=actual_session_id,
+            )
 
-            # Extract assistant message
-            raw_assistant_content = claude_cli.parse_claude_message(chunks)
+            adapter = gateway.get_adapter(backend_selection.backend)
+            assistant_parts = []
+            prompt_cache_hooks.before_send(payload, session_context)
+            async for chunk in adapter.send_prompt(payload):
+                prompt_cache_hooks.after_receive(chunk, session_context)
+                if chunk.get("type") == "error":
+                    raise HTTPException(status_code=500, detail=chunk.get("content", ""))
+                if chunk.get("type") != "delta":
+                    continue
+                filtered_text = MessageAdapter.filter_content(chunk.get("content", ""))
+                if filtered_text and not filtered_text.isspace():
+                    assistant_parts.append(filtered_text)
 
-            if not raw_assistant_content:
-                raise HTTPException(status_code=500, detail="No response from Claude Code")
-
-            # Filter out tool usage and thinking blocks
-            assistant_content = MessageAdapter.filter_content(raw_assistant_content)
+            assistant_content = "".join(assistant_parts).strip()
+            if not assistant_content:
+                raise HTTPException(status_code=500, detail="No response from backend")
 
             # Add assistant response to session if using session mode
             if actual_session_id:
@@ -697,6 +676,8 @@ async def chat_completions(
 
     except HTTPException:
         raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Chat completion error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -710,14 +691,14 @@ async def list_models(
     # Check FastAPI API key if configured
     await verify_api_key(request, credentials)
 
-    # Use constants for single source of truth
-    return {
-        "object": "list",
-        "data": [
-            {"id": model_id, "object": "model", "owned_by": "anthropic"}
-            for model_id in CLAUDE_MODELS
-        ],
-    }
+    data = [
+        {"id": backend, "object": "model", "owned_by": "gateway"}
+        for backend in SUPPORTED_BACKENDS
+    ]
+    data.extend(
+        [{"id": model_id, "object": "model", "owned_by": "anthropic"} for model_id in CLAUDE_MODELS]
+    )
+    return {"object": "list", "data": data}
 
 
 @app.post("/v1/compatibility")
